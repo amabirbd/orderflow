@@ -1,6 +1,8 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
 
+import { connectRabbitMQ, publishOrderCreated } from "./rabbitmq.js";
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -41,7 +43,7 @@ app.post("/orders", async (req, res) => {
         typeof item.productId === "string" &&
         item.productId.trim() &&
         Number.isInteger(item.quantity) &&
-        item.quantity > 0
+        item.quantity > 0,
     )
   ) {
     return res.status(400).json({
@@ -51,24 +53,18 @@ app.post("/orders", async (req, res) => {
 
   try {
     // Step 2: Call Inventory Service
-    const response = await fetch(
-      `${INVENTORY_URL}/inventory/check`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ items }),
-        signal: AbortSignal.timeout(1500),
-      }
-    );
+    const response = await fetch(`${INVENTORY_URL}/inventory/check`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ items }),
+      signal: AbortSignal.timeout(1500),
+    });
 
     // Step 3: Handle upstream HTTP failures
     if (!response.ok) {
-      console.error(
-        "Inventory Service returned:",
-        response.status
-      );
+      console.error("Inventory Service returned:", response.status);
 
       return res.status(503).json({
         message: "Inventory Service is unavailable",
@@ -105,15 +101,25 @@ app.post("/orders", async (req, res) => {
 
     orders.set(order.id, order);
 
-    return res.status(201).json(order);
+    try {
+      const event = await publishOrderCreated(order);
 
+      console.log(`Published ${event.eventType}: ${event.eventId}`);
+
+      return res.status(201).json(order);
+    } catch (error) {
+      console.error("Order event publication failed:", error);
+
+      return res.status(503).json({
+        message:
+          "Order was created in memory, but event publication could not be confirmed. Retrying may create a duplicate.",
+        orderId: order.id,
+      });
+    }
   } catch (error) {
     console.error("Inventory request failed:", error);
 
-    if (
-      error.name === "TimeoutError" ||
-      error.name === "AbortError"
-    ) {
+    if (error.name === "TimeoutError" || error.name === "AbortError") {
       return res.status(504).json({
         message: "Inventory Service timed out",
       });
@@ -138,6 +144,15 @@ app.get("/orders/:id", (req, res) => {
   res.json(order);
 });
 
-app.listen(PORT, () => {
-  console.log(`Order Service running on port ${PORT}`);
+async function start() {
+  await connectRabbitMQ();
+
+  app.listen(PORT, () => {
+    console.log(`Order Service running on port ${PORT}`);
+  });
+}
+
+start().catch((error) => {
+  console.error("Failed to start Order Service:", error);
+  process.exitCode = 1;
 });

@@ -12,6 +12,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "amqplib": "^2.2.0",
     "express": "^5.2.1"
   }
 }
